@@ -56,3 +56,4 @@ Read these in order. Each one builds on the concepts introduced before it, and l
 ## How this repo was put together
 
 These notes were developed progressively in conversation, moving from foundational concepts (what is a REST call, how do you deploy one) through comparative architecture decisions (REST vs gRPC, and a hybrid middle ground) to a concrete application against a real private codebase. Later notes assume the concepts from earlier ones — if something references "the earlier REST deployment guide" or "the general hybrid deployment note," it's referring to an earlier file in this same reading order.
+
