@@ -21,6 +21,7 @@
 10. [Swagger Dynamic Host Resolution](#10-swagger-dynamic-host-resolution)
 11. [Day-to-Day Lifecycle: What Happens When You Push Code](#11-day-to-day-lifecycle-what-happens-when-you-push-code)
 12. [Useful Maintenance Commands & Troubleshooting](#12-useful-maintenance-commands--troubleshooting)
+13. [Nginx Reverse Proxy & Subdomain Setup (`invoice-backend.svtechnologies.com.np`)](#13-nginx-reverse-proxy--subdomain-setup-invoice-backendsvtechnologiescomnp)
 
 ---
 
@@ -356,3 +357,214 @@ docker exec -it invoice_generator_db psql -U invoice_generator_admin -d invoice_
 ```bash
 docker stats
 ```
+
+---
+
+## 13. Nginx Reverse Proxy & Subdomain Setup (`invoice-backend.svtechnologies.com.np`)
+
+To expose the Dockerized API Gateway securely over standard HTTPS (Port 443) using the official company subdomain `invoice-backend.svtechnologies.com.np`, we configured an **Nginx Reverse Proxy** on Lightsail backed by a **Cloudflare Origin SSL Certificate** with **Orange Cloud (Proxied)** protection.
+
+```
+[ Client Browser / Frontend ]
+             │ (HTTPS: 443)
+             ▼
+[ Cloudflare Edge Network (DDoS Protection, WAF, Edge SSL) ]
+             │ (Encrypted HTTPS: 443 via Cloudflare Origin CA)
+             ▼
+[ AWS Lightsail: Nginx Reverse Proxy ]
+             │ (Local HTTP: 127.0.0.1:8080)
+             ▼
+[ Docker Container: api_gateway ]
+```
+
+---
+
+### 13.1 Cloudflare DNS Subdomain Creation
+In the Cloudflare DNS dashboard for `svtechnologies.com.np`:
+* **Type:** `A`
+* **Name:** `invoice-backend`
+* **IPv4 Address:** `43.204.88.188` (Lightsail Static IP)
+* **Proxy Status:** 🟠 **Proxied (Orange Cloud)**
+* **TTL:** `Auto`
+
+**Live Subdomain:** `https://invoice-backend.svtechnologies.com.np`
+
+---
+
+### 13.2 Cloudflare Origin SSL Certificate (15-Year Validity)
+Rather than using Certbot (which requires 90-day renewals, Let's Encrypt rate limits, and temporary bypass of Cloudflare proxying), we use a **Cloudflare Origin CA Certificate**:
+* **Validity:** 15 Years (Zero renewal maintenance).
+* **Security:** End-to-end encryption between Cloudflare edge servers and Lightsail Nginx.
+
+#### 1. Generate in Cloudflare Dashboard:
+1. Navigate to **SSL/TLS** ➔ **Origin Server**.
+2. Click **Create Certificate**.
+3. Select **RSA (2048)**, validity **15 years**, and click **Create**.
+4. Cloudflare outputs two text blocks:
+   * **Origin Certificate**
+   * **Private Key**
+
+#### 2. Install on Lightsail Server:
+Save the certificate and private key to standard SSL paths on the server:
+
+```bash
+# Save Origin Certificate
+sudo nano /etc/ssl/certs/cloudflare_origin.pem
+
+# Save Private Key
+sudo nano /etc/ssl/private/cloudflare_origin.key
+
+# Lock down private key permissions (root read-only)
+sudo chmod 600 /etc/ssl/private/cloudflare_origin.key
+```
+
+#### ⚠️ Critical PEM Format Gotcha & Automated Fix:
+When pasting certificates through terminal emulators (especially from Windows), hidden Windows carriage returns (`\r\n`) or blank lines are often introduced. OpenSSL strictly forbids blank lines inside PEM boundaries (RFC 7468), triggering:
+`PEM routines::bad end line` or `Could not read certificate`.
+
+**Run this cleanup command to ensure clean formatting:**
+```bash
+# 1. Remove all internal blank lines
+sudo sed -i '/^$/d' /etc/ssl/certs/cloudflare_origin.pem
+sudo sed -i '/^$/d' /etc/ssl/private/cloudflare_origin.key
+
+# 2. Ensure a proper final newline at the end of each file
+sudo sed -i -e '$a\' /etc/ssl/certs/cloudflare_origin.pem
+sudo sed -i -e '$a\' /etc/ssl/private/cloudflare_origin.key
+
+# 3. Verify certificate validity directly with OpenSSL
+openssl x509 -in /etc/ssl/certs/cloudflare_origin.pem -text -noout
+```
+*(If valid, OpenSSL displays `Issuer: C = US, O = "Cloudflare, Inc."` and certificate details)*.
+
+---
+
+### 13.3 Nginx Installation & Reverse Proxy Configuration
+
+#### 1. Install Nginx:
+```bash
+sudo apt update && sudo apt install -y nginx
+sudo systemctl enable nginx
+```
+
+#### 2. Create the Site Configuration:
+```bash
+sudo nano /etc/nginx/sites-available/invoice-backend.svtechnologies.com.np
+```
+
+Paste the production reverse-proxy configuration:
+
+```nginx
+# 1. HTTP -> HTTPS Redirect
+server {
+    listen 80;
+    listen [::]:80;
+    server_name invoice-backend.svtechnologies.com.np;
+
+    return 301 https://$host$request_uri;
+}
+
+# 2. HTTPS Reverse Proxy to Go API Gateway
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name invoice-backend.svtechnologies.com.np;
+
+    # Cloudflare Origin SSL Certificates
+    ssl_certificate /etc/ssl/certs/cloudflare_origin.pem;
+    ssl_certificate_key /etc/ssl/private/cloudflare_origin.key;
+
+    # SSL Optimization
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Maximum file upload size (for receipts, invoices, and logos)
+    client_max_body_size 25M;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+
+        # Upstream proxy headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        # WebSocket and token-streaming support (e.g. AI invoice assistant)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Timeouts for database seeding or generation operations
+        proxy_connect_timeout 90s;
+        proxy_send_timeout 90s;
+        proxy_read_timeout 90s;
+    }
+}
+```
+
+#### 3. Activate & Restart Nginx:
+```bash
+# Enable the site via symlink
+sudo ln -s /etc/nginx/sites-available/invoice-backend.svtechnologies.com.np /etc/nginx/sites-enabled/
+
+# Remove default boilerplate site
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# Test configuration syntax
+sudo nginx -t
+
+# Restart Nginx
+sudo systemctl restart nginx
+```
+
+---
+
+### 13.4 Cloudflare SSL/TLS Mode
+In Cloudflare Dashboard for `svtechnologies.com.np`:
+1. Go to **SSL/TLS** ➔ **Overview**.
+2. Select **Full (strict)**.
+   *(Guarantees end-to-end cryptographic verification between Cloudflare edge and Lightsail Nginx)*.
+
+---
+
+### 13.5 Gateway CORS & Swagger Scheme Alignment
+
+1. **CORS Configuration on Lightsail (`.env`)**:
+   In `/home/ubuntu/invoice-generator-backend/.env`, ensure `ALLOWED_ORIGINS` includes both the frontend app and the backend Swagger domain:
+   ```env
+   ALLOWED_ORIGINS=https://invoice-backend.svtechnologies.com.np,https://invoice.svtechnologies.com.np,http://localhost:3000,http://localhost:5173
+   ```
+   Restart gateway: `docker compose -f docker-compose.prod.yml restart gateway`.
+
+2. **Swagger HTTPS Scheme**:
+   In `services/gateway/cmd/main.go`, the Swagger annotations specify:
+   ```go
+   // @schemes https http
+   ```
+   Listing `https` first ensures Swagger UI defaults to sending HTTPS requests, eliminating browser Mixed-Content / CORS failure blocks when testing endpoints from `https://invoice-backend.svtechnologies.com.np/swagger/index.html`.
+
+---
+
+### 13.6 Useful Maintenance & Debugging Commands
+
+```bash
+# Check Nginx status
+sudo systemctl status nginx
+
+# Test Nginx configuration syntax
+sudo nginx -t
+
+# View live Nginx error logs (helpful for proxy/timeout debugging)
+sudo tail -f /var/log/nginx/error.log
+
+# View live Nginx access logs
+sudo tail -f /var/log/nginx/access.log
+
+# Verify certificate validity directly with OpenSSL
+openssl x509 -in /etc/ssl/certs/cloudflare_origin.pem -text -noout
+```
+
